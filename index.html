@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Infinite Garden with Hands</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05030d; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  video { display: none; }
+  #status {
+    position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    padding: 5px 14px; border-radius: 999px;
+    background: rgba(0, 0, 0, .45); border: 1px solid rgba(255, 255, 255, .12);
+    color: #e8e4ff; font: 12px/1.2 system-ui, sans-serif; white-space: nowrap;
+    backdrop-filter: blur(4px);
+  }
+  #status i { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #ffc83d; margin-right: 7px; }
+  #hint {
+    position: fixed; top: 10px; left: 12px; color: rgba(232, 228, 255, .45);
+    font: 11px/1.4 system-ui, sans-serif; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="status"><i></i><span id="statusText">Starting camera...</span></div>
+<div id="hint">Mueve la mano frente a la cámara · C = limpiar jardín</div>
+
+<!-- MediaPipe Hands (CDN) -->
+<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const video = document.getElementById('cam');
+  const statusText = document.getElementById('statusText');
+
+  let W, H, DPR, S;           // tamaño, densidad de píxeles y escala general
+  let stars = [];
+  let hands = [];             // manos actuales (ya mapeadas a pantalla)
+  let flowers = [];
+  const lastSpawn = [];
+  let mouseMode = false;
+  const MAX_FLOWERS = 70;
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeOutBack = t => { const c = 1.9; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+
+  /* ---------- tamaño / fondo ---------- */
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    S = clamp(Math.min(W, H) / 700, 0.6, 1.6);
+    stars = Array.from({ length: 170 }, () => ({
+      x: Math.random() * W, y: Math.random() * H,
+      r: rand(0.4, 1.5), ph: rand(0, 6.28), sp: rand(0.6, 2.2)
+    }));
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function drawBackground(now) {
+    ctx.fillStyle = '#05030d';
+    ctx.fillRect(0, 0, W, H);
+    let g = ctx.createRadialGradient(W / 2, H * 1.05, 0, W / 2, H * 1.05, H * 0.95);
+    g.addColorStop(0, 'rgba(150, 50, 150, .55)');
+    g.addColorStop(0.5, 'rgba(70, 25, 120, .30)');
+    g.addColorStop(1, 'rgba(5, 3, 13, 0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    g = ctx.createRadialGradient(W * 0.28, H * 0.65, 0, W * 0.28, H * 0.65, H * 0.6);
+    g.addColorStop(0, 'rgba(60, 40, 140, .22)');
+    g.addColorStop(1, 'rgba(5, 3, 13, 0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    for (const s of stars) {
+      const a = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(now / 1000 * s.sp + s.ph));
+      ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.283); ctx.fill();
+    }
+  }
+
+  /* ---------- manos ---------- */
+  const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+                [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  const TIPS = [4, 8, 12, 16, 20];
+
+  function drawHand(h) {
+    const col = `hsl(${h.hue}, 95%, 72%)`;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = `hsla(${h.hue}, 95%, 75%, .85)`;
+    ctx.lineWidth = 1.6;
+    ctx.shadowColor = col; ctx.shadowBlur = 10;
+    ctx.beginPath();
+    for (const [a, b] of CONN) {
+      ctx.moveTo(h.pts[a].x, h.pts[a].y);
+      ctx.lineTo(h.pts[b].x, h.pts[b].y);
+    }
+    ctx.stroke();
+    h.pts.forEach((p, i) => {
+      const tip = TIPS.includes(i);
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(p.x, p.y, tip ? 3.6 : 2.6, 0, 6.283); ctx.fill();
+    });
+    ctx.restore();
+  }
+
+  function palmCenter(pts) {
+    const ids = [0, 5, 9, 13, 17];
+    let x = 0, y = 0;
+    ids.forEach(i => { x += pts[i].x; y += pts[i].y; });
+    return { x: x / ids.length, y: y / ids.length };
+  }
+
+  /* ---------- flores ---------- */
+  const TYPES = ['sun', 'tulip', 'lily', 'blossom'];
+  const TYPE_W = [0.25, 0.30, 0.20, 0.25];
+  function pickType() {
+    let r = Math.random();
+    for (let i = 0; i < TYPES.length; i++) { r -= TYPE_W[i]; if (r <= 0) return TYPES[i]; }
+    return 'tulip';
+  }
+
+  function spawn(x, y) {
+    const baseY = H - 46;
+    y = Math.min(y, baseY - 90 * S);
+    y = Math.max(y, 30);
+    const bx = W / 2 + rand(-0.035, 0.035) * W;
+    const type = pickType();
+    const f = {
+      type, x, y, bx, by: baseY,
+      cx: bx + (x - bx) * 0.12 + rand(-30, 30) * S,
+      cy: baseY - (baseY - y) * 0.62,
+      born: performance.now(),
+      grow: rand(900, 1500),
+      ph: rand(0, 6.28),
+      alpha: 1, dying: false,
+      stem: pick(['#4fd16f', '#3fbf6a', '#58d97a']),
+      color: type === 'tulip' ? pick(['#ff2d4d', '#ff4f9a', '#ff86c1', '#ff2d4d'])
+           : type === 'blossom' ? pick(['#ff5a3c', '#ff7a45', '#ff4a5e']) : '#fff',
+      r: ({ sun: 30, tulip: 17, lily: 28, blossom: 20 })[type] * S * rand(0.85, 1.15),
+      leaves: Array.from({ length: Math.floor(rand(2, 4.99)) }, () => ({
+        t: rand(0.18, 0.7), side: Math.random() < 0.5 ? -1 : 1,
+        len: rand(26, 46) * S, w: rand(7, 12) * S,
+        color: pick(['#3fbf6a', '#37a8c7', '#4cc9a0', '#4aa3c7'])
+      }))
+    };
+    flowers.push(f);
+    const alive = flowers.filter(q => !q.dying);
+    if (alive.length > MAX_FLOWERS) alive[0].dying = true;
+  }
+
+  function trySpawn(i, x, y) {
+    const now = performance.now();
+    const last = lastSpawn[i] || (lastSpawn[i] = { x: -1e9, y: -1e9, t: 0 });
+    const d = Math.hypot(x - last.x, y - last.y);
+    if (now - last.t > 160 && d > Math.min(W, H) * 0.07) {
+      spawn(x, y);
+      last.x = x; last.y = y; last.t = now;
+    }
+  }
+
+  function bez(f, t, sx) {
+    const u = 1 - t;
+    const x1 = f.cx + sx * 0.4, x2 = f.x + sx;
+    return {
+      x: u * u * f.bx + 2 * u * t * x1 + t * t * x2,
+      y: u * u * f.by + 2 * u * t * f.cy + t * t * f.y,
+      tx: 2 * u * (x1 - f.bx) + 2 * t * (x2 - x1),
+      ty: 2 * u * (f.cy - f.by) + 2 * t * (f.y - f.cy)
+    };
+  }
+
+  function drawLeaf(L, ang, w, color) {
+    ctx.save();
+    ctx.rotate(ang);
+    const g = ctx.createLinearGradient(0, 0, L, 0);
+    g.addColorStop(0, color); g.addColorStop(1, 'rgba(255,255,255,.35)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.quadraticCurveTo(L * 0.5, -w, L, 0);
+    ctx.quadraticCurveTo(L * 0.5, w, 0, 0);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawSun(r) {
+    const n = 18;
+    for (let layer = 0; layer < 2; layer++) {
+      ctx.save();
+      if (layer) ctx.rotate(Math.PI / n);
+      ctx.fillStyle = layer ? '#ffd91a' : '#ffae00';
+      for (let i = 0; i < n; i++) {
+        ctx.save(); ctx.rotate(i * Math.PI * 2 / n);
+        ctx.beginPath(); ctx.ellipse(r * 0.72, 0, r * 0.42, r * 0.16, 0, 0, 6.283); ctx.fill();
+        ctx.restore();
+      }
+      ctx.restore();
+    }
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.44);
+    g.addColorStop(0, '#7a4414'); g.addColorStop(1, '#3a1d07');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, r * 0.44, 0, 6.283); ctx.fill();
+    ctx.fillStyle = 'rgba(255,190,80,.35)';
+    for (let i = 1; i < 26; i++) {
+      const a = i * 2.39996, d = r * 0.4 * Math.sqrt(i / 26);
+      ctx.beginPath(); ctx.arc(Math.cos(a) * d, Math.sin(a) * d, r * 0.025, 0, 6.283); ctx.fill();
+    }
+  }
+
+  function drawTulip(r, color) {
+    ctx.save();
+    ctx.shadowColor = color; ctx.shadowBlur = 14;
+    const g = ctx.createLinearGradient(0, -r, 0, r);
+    g.addColorStop(0, '#fff3f6'); g.addColorStop(0.35, color); g.addColorStop(1, color);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(0, r);
+    ctx.bezierCurveTo(-r * 1.0, r * 0.8, -r * 1.0, -r * 0.3, -r * 0.7, -r * 1.0);
+    ctx.lineTo(-r * 0.3, -r * 0.35);
+    ctx.lineTo(0, -r * 1.05);
+    ctx.lineTo(r * 0.3, -r * 0.35);
+    ctx.lineTo(r * 0.7, -r * 1.0);
+    ctx.bezierCurveTo(r * 1.0, -r * 0.3, r * 1.0, r * 0.8, 0, r);
+    ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(0, r * 0.8); ctx.quadraticCurveTo(-r * 0.1, 0, 0, -r * 0.6); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawLily(r) {
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,255,255,.7)'; ctx.shadowBlur = 12;
+    for (let layer = 0; layer < 2; layer++) {
+      const rr = layer ? r * 0.82 : r;
+      for (let i = 0; i < 6; i++) {
+        ctx.save();
+        ctx.rotate(i * Math.PI / 3 + (layer ? Math.PI / 6 : 0));
+        const g = ctx.createLinearGradient(0, 0, 0, -rr);
+        g.addColorStop(0, '#fbe6ef'); g.addColorStop(0.5, '#ffffff'); g.addColorStop(1, '#f1f1ff');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.quadraticCurveTo(rr * 0.34, -rr * 0.45, 0, -rr);
+        ctx.quadraticCurveTo(-rr * 0.34, -rr * 0.45, 0, 0);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(190,150,60,.8)'; ctx.fillStyle = '#e8b73a'; ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+      const a = i * Math.PI / 3 + 0.3, d = r * 0.4;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * d, Math.sin(a) * d); ctx.stroke();
+      ctx.beginPath(); ctx.arc(Math.cos(a) * d, Math.sin(a) * d, r * 0.05, 0, 6.283); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawBlossom(r, color) {
+    ctx.save();
+    ctx.shadowColor = color; ctx.shadowBlur = 20;
+    for (let i = 0; i < 5; i++) {
+      const a = i * Math.PI * 2 / 5;
+      const px = Math.cos(a) * r * 0.5, py = Math.sin(a) * r * 0.5;
+      const g = ctx.createRadialGradient(px, py, 0, px, py, r * 0.48);
+      g.addColorStop(0, '#ffb15c'); g.addColorStop(1, color);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(px, py, r * 0.46, 0, 6.283); ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    const g2 = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.3);
+    g2.addColorStop(0, '#fff2a8'); g2.addColorStop(1, '#ff9d2e');
+    ctx.fillStyle = g2;
+    ctx.beginPath(); ctx.arc(0, 0, r * 0.28, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawFlower(f, now, dt) {
+    if (f.dying) f.alpha -= dt / 900;
+    const g = clamp((now - f.born) / f.grow, 0, 1);
+    const stemT = easeOutCubic(g);
+    const bloomT = clamp((g - 0.55) / 0.45, 0, 1);
+    const sx = Math.sin(now / 1000 * 1.1 + f.ph) * 5 * S * stemT;
+
+    ctx.save();
+    ctx.globalAlpha = clamp(f.alpha, 0, 1);
+
+    // tallo
+    ctx.strokeStyle = f.stem; ctx.lineWidth = 2.2 * S; ctx.lineCap = 'round';
+    ctx.beginPath();
+    const steps = 22;
+    for (let i = 0; i <= steps; i++) {
+      const p = bez(f, stemT * i / steps, sx);
+      i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y);
+    }
+    ctx.stroke();
+
+    // hojas
+    for (const L of f.leaves) {
+      if (stemT <= L.t) continue;
+      const p = bez(f, L.t, sx);
+      const tang = Math.atan2(p.ty, p.tx);
+      const grow = clamp((stemT - L.t) / 0.2, 0, 1);
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      drawLeaf(L.len * grow, tang + L.side * 0.85, L.w * grow, L.color);
+      ctx.restore();
+    }
+
+    // cabeza
+    const head = bez(f, stemT, sx);
+    ctx.translate(head.x, head.y);
+    if (bloomT <= 0) {
+      ctx.fillStyle = f.stem;
+      ctx.beginPath(); ctx.arc(0, 0, 3 * S, 0, 6.283); ctx.fill();
+    } else {
+      const tilt = Math.atan2(head.tx, -head.ty) * 0.6 + sx * 0.01;
+      ctx.rotate(tilt);
+      const k = easeOutBack(bloomT);
+      ctx.scale(k, k);
+      if (f.type === 'sun') drawSun(f.r);
+      else if (f.type === 'tulip') drawTulip(f.r, f.color);
+      else if (f.type === 'lily') drawLily(f.r);
+      else drawBlossom(f.r, f.color);
+    }
+    ctx.restore();
+  }
+
+  /* ---------- resultados de MediaPipe ---------- */
+  function onResults(r) {
+    const lms = r.multiHandLandmarks || [];
+    const prev = hands;
+    hands = lms.map((lm, i) => {
+      const pts = lm.map((p, k) => {
+        const x = (1 - p.x) * W, y = p.y * H;   // espejo
+        const q = prev[i] && prev[i].pts[k];
+        return q ? { x: q.x + (x - q.x) * 0.55, y: q.y + (y - q.y) * 0.55 } : { x, y };
+      });
+      const lab = r.multiHandedness && r.multiHandedness[i] ? r.multiHandedness[i].label : 'Left';
+      return { pts, hue: lab === 'Left' ? 205 : 335 };
+    });
+    hands.forEach((h, i) => { const c = palmCenter(h.pts); trySpawn(i, c.x, c.y); });
+    lastSpawn.length = hands.length;
+    setStatus(hands.length ? `${hands.length} hand(s) detected` : 'Waiting for hand...');
+  }
+
+  function setStatus(t) { if (statusText.textContent !== t) statusText.textContent = t; }
+
+  /* ---------- cámara ---------- */
+  async function startCamera() {
+    if (typeof Hands === 'undefined') throw new Error('MediaPipe no cargó (¿sin internet?)');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: 'user' }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    const tracker = new Hands({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+    });
+    tracker.setOptions({
+      maxNumHands: 2, modelComplexity: 1,
+      minDetectionConfidence: 0.6, minTrackingConfidence: 0.5
+    });
+    tracker.onResults(onResults);
+
+    let busy = false;
+    const pump = async () => {
+      if (!busy && video.readyState >= 2) {
+        busy = true;
+        try { await tracker.send({ image: video }); } catch (e) { console.error(e); }
+        busy = false;
+      }
+      requestAnimationFrame(pump);
+    };
+    pump();
+    setStatus('Waiting for hand...');
+  }
+
+  function enableMouseMode(reason) {
+    console.warn(reason);
+    mouseMode = true;
+    setStatus('Modo mouse (sin cámara): mueve el cursor');
+    window.addEventListener('pointermove', e => {
+      hands = [{ hue: 205, pts: Array.from({ length: 21 }, () => ({ x: e.clientX, y: e.clientY })) }];
+      trySpawn(0, e.clientX, e.clientY);
+    });
+  }
+
+  startCamera().catch(err => enableMouseMode(err));
+
+  window.addEventListener('keydown', e => {
+    if (e.key.toLowerCase() === 'c') flowers.forEach(f => f.dying = true);
+  });
+
+  /* ---------- bucle principal ---------- */
+  let lastT = performance.now();
+  function frame(now) {
+    const dt = now - lastT; lastT = now;
+    drawBackground(now);
+    flowers.forEach(f => drawFlower(f, now, dt));
+    flowers = flowers.filter(f => f.alpha > 0);
+    if (mouseMode) {
+      hands.forEach(h => {
+        const p = h.pts[0];
+        ctx.save(); ctx.fillStyle = '#9fd6ff'; ctx.shadowColor = '#6cb8ff'; ctx.shadowBlur = 14;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 6.283); ctx.fill(); ctx.restore();
+      });
+    } else {
+      hands.forEach(drawHand);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // para pruebas
+  window.__garden = { spawn, get count() { return flowers.length; } };
+})();
+</script>
+</body>
+</html>
